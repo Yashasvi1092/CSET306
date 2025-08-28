@@ -1,0 +1,543 @@
+Direct colab link:- https://colab.research.google.com/drive/12IE85NsBG6AqFhzfI4iTx02Y6C91vzr8?usp=sharing
+
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense, Dropout, Bidirectional
+from tensorflow.keras.utils import to_categorical
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping
+import datetime
+import warnings
+import traceback  # Added for better error handling
+warnings.filterwarnings('ignore')
+
+# Mount Google Drive to access the dataset
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Function to load the dataset
+def load_dataset(file_path):
+    """
+    Load the dataset from the specified file path
+    """
+    print("Loading dataset...")
+    try:
+        # Try reading the file based on extension
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        elif file_path.endswith('.xlsx') or file_path.endswith('.xls'):
+            df = pd.read_excel(file_path)
+        else:
+            print(f"Unsupported file format. Please provide path to a CSV or Excel file.")
+            return None
+
+        print(f"Dataset loaded successfully with shape: {df.shape}")
+        return df
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return None
+
+# Function to preprocess the data
+def preprocess_data(df, sample_size=20000):
+    """
+    Preprocess the data for BiGRU model with improved handling of categorical data and NaN values
+    """
+    print("Preprocessing data...")
+
+    # Sample the data if needed
+    if df.shape[0] > sample_size:
+        df = df.sample(sample_size, random_state=42)
+        print(f"Sampled dataset to {sample_size} rows")
+
+    # Handle missing values in the dataset
+    for col in df.columns:
+        if col in ['Date', 'Timestamp']:
+            continue  # Skip date/time columns
+        if df[col].dtype == 'object':
+            # Replace '-' with NaN
+            df[col] = df[col].replace('-', np.nan)
+            # Fill missing values with a placeholder
+            df[col] = df[col].fillna('unknown')
+        else:
+            # For numeric columns, fill with median
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].fillna(df[col].median())
+
+    # Handle categorical features
+    categorical_cols = ['Protocol', 'Conn_state', 'anomaly_alert']
+    # Filter to only include categorical columns that exist in the dataframe
+    categorical_cols = [col for col in categorical_cols if col in df.columns]
+
+    # Convert string columns to numeric where possible
+    for col in df.columns:
+        if col not in categorical_cols + ['Date', 'Timestamp', 'class1', 'class2', 'class3']:
+            try:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                # Replace any remaining NaNs with median
+                df[col] = df[col].fillna(df[col].median())
+            except:
+                pass
+
+    # Get numerical columns
+    numerical_cols = [col for col in df.columns
+                     if col not in categorical_cols + ['Date', 'Timestamp', 'class1', 'class2', 'class3']
+                     and pd.api.types.is_numeric_dtype(df[col])]
+
+    print(f"Categorical columns: {categorical_cols}")
+    print(f"Numerical columns: {numerical_cols}")
+
+    # One-hot encode categorical features
+    encoded_cats = []
+
+    for col in categorical_cols:
+        if col in df.columns:
+            # Handle NaN values in categorical columns
+            df[col] = df[col].fillna('unknown')
+            # Reshape to 2D array for encoder
+            col_data = df[[col]].values
+            try:
+                encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                encoded = encoder.fit_transform(col_data)
+                encoded_df = pd.DataFrame(encoded, columns=[f"{col}_{i}" for i in range(encoded.shape[1])], index=df.index)
+                encoded_cats.append(encoded_df)
+            except Exception as e:
+                print(f"Error encoding column {col}: {e}")
+                # If encoding fails, try binary encoding
+                if col == 'anomaly_alert':
+                    df['anomaly_alert_binary'] = df['anomaly_alert'].apply(lambda x: 1 if str(x).lower() == 'true' else 0)
+                    encoded_df = pd.DataFrame(df['anomaly_alert_binary'], columns=['anomaly_alert_binary'], index=df.index)
+                    encoded_cats.append(encoded_df)
+        else:
+            print(f"Warning: Column '{col}' not found in dataset")
+
+    if encoded_cats:
+        encoded_df = pd.concat(encoded_cats, axis=1)
+    else:
+        encoded_df = pd.DataFrame(index=df.index)
+
+    # Scale numerical features
+    scaler = StandardScaler()
+    if numerical_cols:
+        df_numerical = df[numerical_cols].copy()
+
+        # Replace infinity and NaN values
+        df_numerical = df_numerical.replace([np.inf, -np.inf], np.nan)
+        df_numerical = df_numerical.fillna(df_numerical.mean())
+
+        scaled_features = scaler.fit_transform(df_numerical)
+        scaled_df = pd.DataFrame(scaled_features, columns=numerical_cols, index=df.index)
+    else:
+        scaled_df = pd.DataFrame(index=df.index)
+
+    # Combine scaled numerical and encoded categorical features
+    X = pd.concat([scaled_df, encoded_df], axis=1)
+
+    # Handle target variables properly with LabelEncoder and one-hot encoding
+    target_cols = ['class1', 'class2', 'class3']
+    y_arrays = []
+    label_encoders = []
+    num_classes_list = []
+
+    for col in target_cols:
+        # Ensure target column is in the dataset
+        if col not in df.columns:
+            print(f"Error: Target column '{col}' not found in dataset")
+            return None, None, None, None
+
+        # Fill any missing values
+        df[col] = df[col].fillna('unknown')
+
+        # Use LabelEncoder for consistent numeric representation
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(df[col])
+        label_encoders.append(le)
+
+        # Get number of unique classes
+        num_classes = len(le.classes_)
+        num_classes_list.append(num_classes)
+
+        # Convert to categorical if more than 2 classes
+        if num_classes > 2:
+            y_one_hot = to_categorical(y_encoded, num_classes=num_classes)
+            y_arrays.append(y_one_hot)
+            print(f"Target {col} encoded to {num_classes} classes (one-hot)")
+        else:
+            # For binary classification, reshape to proper format
+            y_arrays.append(y_encoded.reshape(-1, 1))
+            print(f"Target {col} encoded as binary")
+
+    print(f"Preprocessing complete. X shape: {X.shape}")
+    for i, (y, col) in enumerate(zip(y_arrays, target_cols)):
+        print(f"Target {col} shape: {y.shape}, Classes: {num_classes_list[i]}")
+
+    # Print class mappings for reference
+    for col, le in zip(target_cols, label_encoders):
+        print(f"\nClass mapping for {col}:")
+        for i, class_name in enumerate(le.classes_):
+            print(f"  {class_name} -> {i}")
+
+    return X, y_arrays, num_classes_list, label_encoders
+
+# Function to reshape data for GRU
+def reshape_for_gru(X, time_steps=1):
+    """
+    Reshape the data for BiGRU model
+    """
+    # For GRU, we need to reshape the data to [samples, time_steps, features]
+    X_reshaped = np.array(X).reshape(X.shape[0], time_steps, X.shape[1])
+    return X_reshaped
+
+# Function to build the BiGRU model
+def build_bigru_model(input_shape, num_classes):
+    """
+    Build a multi-output Bidirectional GRU model for intrusion detection with proper configuration
+    for multi-class outputs
+    """
+    # Input layer
+    input_layer = tf.keras.layers.Input(shape=input_shape)
+
+    # BiGRU layers - replacing BiLSTM with Bidirectional GRU
+    gru_layer = Bidirectional(GRU(128, return_sequences=True))(input_layer)
+    gru_layer = Dropout(0.2)(gru_layer)
+    gru_layer = Bidirectional(GRU(64))(gru_layer)
+    gru_layer = Dropout(0.2)(gru_layer)
+
+    # Common dense layer
+    common = Dense(64, activation='relu')(gru_layer)
+    common = Dropout(0.2)(common)
+
+    # Separate outputs for each class with appropriate activation functions
+    outputs = []
+    output_names = []
+
+    for i, n_classes in enumerate(num_classes):
+        output_name = f'class{i+1}_output'
+        # Use softmax for multi-class, sigmoid for binary
+        if n_classes > 2:
+            output = Dense(n_classes, activation='softmax', name=output_name)(common)
+        else:
+            output = Dense(1, activation='sigmoid', name=output_name)(common)
+
+        outputs.append(output)
+        output_names.append(output_name)
+
+    # Create model
+    model = tf.keras.models.Model(inputs=input_layer, outputs=outputs)
+
+    # Compile model with appropriate loss functions
+    losses = {}
+    metrics = {}
+
+    for i, (output_name, n_classes) in enumerate(zip(output_names, num_classes)):
+        if n_classes > 2:
+            losses[output_name] = 'categorical_crossentropy'
+        else:
+            losses[output_name] = 'binary_crossentropy'
+
+        metrics[output_name] = ['accuracy']
+
+    model.compile(
+        optimizer='adam',
+        loss=losses,
+        metrics=metrics
+    )
+
+    return model
+
+# Function to train and evaluate the model
+def train_and_evaluate(model, X_train, y_train, X_test, y_test, epochs=20, batch_size=32):
+    """
+    Train and evaluate the BiGRU model
+    """
+    # Prepare the targets as dictionary
+    y_train_dict = {}
+    y_test_dict = {}
+
+    for i, y in enumerate(y_train):
+        y_train_dict[f'class{i+1}_output'] = y
+
+    for i, y in enumerate(y_test):
+        y_test_dict[f'class{i+1}_output'] = y
+
+    # Early stopping to prevent overfitting
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=5,
+        restore_best_weights=True
+    )
+
+    # Train the model
+    history = model.fit(
+        X_train,
+        y_train_dict,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_split=0.2,
+        callbacks=[early_stopping],
+        verbose=1
+    )
+
+    # Evaluate the model
+    results = model.evaluate(X_test, y_test_dict, verbose=1)
+
+    # Print evaluation results in a clearer format
+    print("\nEvaluation Results:")
+    if isinstance(results, list):
+        total_loss = results[0]
+        print(f"Total loss: {total_loss:.4f}")
+
+        # Extract individual metrics (losses and accuracies)
+        metrics_per_output = (len(results) - 1) // len(y_test)
+        for i in range(len(y_test)):
+            output_name = f'class{i+1}_output'
+            print(f"\n{output_name}:")
+            loss_idx = i + 1
+            acc_idx = i + 1 + len(y_test)
+            try:
+                print(f"  Loss: {results[loss_idx]:.4f}")
+                print(f"  Accuracy: {results[acc_idx]:.4f}")
+            except:
+                print("  Error retrieving metrics")
+    else:
+        print("Results format not as expected.")
+
+    # Get predictions
+    predictions = model.predict(X_test)
+
+    return history, predictions
+
+# Function to visualize the results
+def visualize_results(history, predictions, y_test, num_classes, label_encoders):
+    """
+    Visualize the training history and confusion matrices with improved error handling
+    """
+    # Plot training history
+    plt.figure(figsize=(15, 10))
+
+    # Plot loss
+    plt.subplot(2, 2, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    # Plot accuracy for each output
+    for i, class_name in enumerate(['class1', 'class2', 'class3']):
+        plt.subplot(2, 2, i+2)
+        acc_key = f'{class_name}_output_accuracy'
+        val_acc_key = f'val_{class_name}_output_accuracy'
+        if acc_key in history.history and val_acc_key in history.history:
+            plt.plot(history.history[acc_key], label=f'Training Accuracy')
+            plt.plot(history.history[val_acc_key], label=f'Validation Accuracy')
+            plt.title(f'{class_name} Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # Confusion matrices
+    class_names = ['class1', 'class2', 'class3']
+
+    for i, (pred, true, n_classes, le) in enumerate(zip(predictions, y_test, num_classes, label_encoders)):
+        try:
+            print(f"\nProcessing visualization for {class_names[i]}:")
+            print(f"  Prediction shape: {pred.shape}")
+            print(f"  True values shape: {true.shape}")
+            print(f"  Number of classes: {n_classes}")
+
+            plt.figure(figsize=(10, 8))
+
+            # Get class labels for better interpretation
+            labels = le.classes_
+
+            # For large number of classes, limit to top N classes
+            max_classes_to_show = 10
+            if n_classes > max_classes_to_show:
+                # Get indices of most frequent classes
+                if len(true.shape) > 1 and true.shape[1] > 1:  # One-hot encoded
+                    class_counts = np.sum(true, axis=0)
+                else:  # Binary or multi-class as single column
+                    class_counts = np.bincount(true.flatten().astype(int))
+
+                top_classes = np.argsort(class_counts)[-max_classes_to_show:]
+                display_classes = top_classes
+                display_labels = [labels[i] if i < len(labels) else f'Class {i}' for i in top_classes]
+                print(f"  Limiting display to top {max_classes_to_show} classes")
+            else:
+                display_classes = range(n_classes)
+                display_labels = labels
+                print(f"  Displaying all {n_classes} classes")
+
+            # Convert predictions to class labels
+            if n_classes > 2:
+                y_pred = np.argmax(pred, axis=1)
+                if len(true.shape) > 1 and true.shape[1] > 1:  # Check if one-hot encoded
+                    y_true = np.argmax(true, axis=1)
+                else:
+                    y_true = true.flatten()
+            else:
+                y_pred = (pred > 0.5).astype(int).flatten()
+                y_true = true.flatten()
+
+            print(f"  Converted prediction shape: {y_pred.shape}")
+            print(f"  Converted true values shape: {y_true.shape}")
+
+            # Plot confusion matrix
+            cm = confusion_matrix(y_true, y_pred, labels=display_classes)
+
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=display_labels,
+                        yticklabels=display_labels)
+            plt.title(f'Confusion Matrix for {class_names[i]}')
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.tight_layout()
+            plt.show()
+
+            # Print classification report
+            print(f"\nClassification Report for {class_names[i]}:")
+            try:
+                # Use the labels parameter to specify which labels to include in the report
+                report = classification_report(
+                    y_true, y_pred,
+                    labels=display_classes,  # Only include the classes we're displaying
+                    target_names=display_labels,
+                    zero_division=0  # Handle division by zero more gracefully
+                )
+                print(report)
+            except Exception as e:
+                print(f"  Error generating classification report: {e}")
+                # Fall back to a simpler approach if needed
+                accuracy = accuracy_score(y_true, y_pred)
+                print(f"  Overall accuracy: {accuracy:.4f}")
+
+        except Exception as e:
+            print(f"Error in visualization for {class_names[i]}: {e}")
+            traceback.print_exc()
+
+# Main function to run the entire process
+def main():
+    # Ask for the file path
+    file_path = input("Enter the path to your dataset in Google Drive (e.g., /content/drive/MyDrive/dataset.csv): ")
+
+    # Load and preprocess the data
+    df = load_dataset(file_path)
+    if df is None:
+        return
+
+    # Print dataset info
+    print("\nDataset Information:")
+    print(df.info())
+    print("\nSample data:")
+    print(df.head())
+    print("\nTarget class distribution:")
+    for cls in ['class1', 'class2', 'class3']:
+        if cls in df.columns:
+            print(f"{cls} counts: {df[cls].value_counts()}")
+
+    # Preprocess the data
+    X, y, num_classes, label_encoders = preprocess_data(df)
+    if X is None:
+        return
+
+    # Split the data
+    try:
+        X_train, X_test = train_test_split(X, test_size=0.2, random_state=42, stratify=y[2])  # Stratify on class3 (binary)
+        y_train = []
+        y_test = []
+
+        for i in range(len(y)):
+            y_train_i, y_test_i = train_test_split(y[i], test_size=0.2, random_state=42, stratify=y[2])
+            y_train.append(y_train_i)
+            y_test.append(y_test_i)
+    except Exception as e:
+        print(f"Error during data splitting: {e}")
+        print("Trying alternative splitting without stratification...")
+        X_train, X_test = train_test_split(X, test_size=0.2, random_state=42)
+        y_train = []
+        y_test = []
+
+        for i in range(len(y)):
+            y_train_i, y_test_i = train_test_split(y[i], test_size=0.2, random_state=42)
+            y_train.append(y_train_i)
+            y_test.append(y_test_i)
+
+    # Print shapes to debug
+    print(f"X_train shape: {X_train.shape}")
+    print(f"X_test shape: {X_test.shape}")
+    for i, (y_tr, y_te) in enumerate(zip(y_train, y_test)):
+        print(f"y{i+1}_train shape: {y_tr.shape}")
+        print(f"y{i+1}_test shape: {y_te.shape}")
+
+    # Reshape the data for BiGRU
+    X_train_gru = reshape_for_gru(X_train)
+    X_test_gru = reshape_for_gru(X_test)
+
+    print(f"X_train_gru shape: {X_train_gru.shape}")
+    print(f"X_test_gru shape: {X_test_gru.shape}")
+
+    # Build the BiGRU model
+    input_shape = (X_train_gru.shape[1], X_train_gru.shape[2])
+    print(f"Building BiGRU model with input shape: {input_shape}")
+    print(f"Number of classes for each output: {num_classes}")
+    model = build_bigru_model(input_shape, num_classes)
+    model.summary()
+
+    # Check array sizes for consistency
+    train_sizes = [X_train_gru.shape[0]] + [y.shape[0] for y in y_train]
+    test_sizes = [X_test_gru.shape[0]] + [y.shape[0] for y in y_test]
+
+    print(f"Training shapes: {train_sizes}")
+    print(f"Testing shapes: {test_sizes}")
+
+    if len(set(train_sizes)) > 1 or len(set(test_sizes)) > 1:
+        print("ERROR: Inconsistent array sizes. Attempting to fix...")
+
+        # Get minimum sizes
+        min_train_size = min(train_sizes)
+        min_test_size = min(test_sizes)
+
+        # Trim arrays to match
+        X_train_gru = X_train_gru[:min_train_size]
+        y_train = [y[:min_train_size] for y in y_train]
+
+        X_test_gru = X_test_gru[:min_test_size]
+        y_test = [y[:min_test_size] for y in y_test]
+
+        print(f"Arrays resized to train: {min_train_size}, test: {min_test_size}")
+
+    # Train and evaluate the model
+    history, predictions = train_and_evaluate(model, X_train_gru, y_train, X_test_gru, y_test, epochs=20, batch_size=32)
+
+    # Visualize the results with improved error handling
+    visualize_results(history, predictions, y_test, num_classes, label_encoders)
+
+    # Save the model
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        model.save(f'/content/drive/MyDrive/bigru_intrusion_detection_{timestamp}.h5')
+        print(f"Model saved as: bigru_intrusion_detection_{timestamp}.h5")
+    except Exception as e:
+        print(f"Error saving model: {e}")
+        # Try saving to the current directory instead
+        model.save(f'bigru_intrusion_detection_{timestamp}.h5')
+        print(f"Model saved locally as: bigru_intrusion_detection_{timestamp}.h5")
+
+# Run the main function
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"An error occurred in the main function: {e}")
+        traceback.print_exc()
